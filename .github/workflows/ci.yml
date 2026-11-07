@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Demo trips every limit
+        run: |
+          tool-guard demo > demo.txt 2>&1
+          cat demo.txt
+          grep -q "tool_timeout" demo.txt
+          grep -q "loop_detected" demo.txt
+          grep -q "tool_not_allowed" demo.txt
+          grep -q "ValueError" demo.txt
+
+      - name: Demo summary reconciles
+        run: |
+          python - <<'PY'
+          import io, json, re
+          from contextlib import redirect_stdout
+          from toolguard.cli import main
+          buf = io.StringIO()
+          with redirect_stdout(buf):
+              main(["demo"])
+          text = buf.getvalue()
+          # The JSON summary is the final object in the output.
+          payload = json.loads(text[text.index("{"):])
+          assert payload["calls"] == payload["recorded"], payload
+          assert payload["ok"] + payload["failed"] == payload["calls"], payload
+          print("summary reconciles:", payload["calls"], "calls")
+          PY
+
+      - name: Loop detection is enforced, not advisory
+        run: |
+          python - <<'PY'
+          from toolguard import Limits, LoopDetected, ToolGuard
+
+          guard = ToolGuard(limits=Limits(max_repeats=2))
+
+          @guard.tool
+          def search(q: str) -> str:
+              return q
+
+          guard.call("search", {"q": "same"})
+          guard.call("search", {"q": "same"})
+          try:
+              guard.call("search", {"q": "same"})
+          except LoopDetected:
+              print("loop blocked as expected")
+          else:
+              raise SystemExit("loop was NOT blocked")
+          PY
+
+      - name: Allowlist is enforced
+        run: |
+          python - <<'PY'
+          from toolguard import ToolGuard, ToolNotAllowed
+          guard = ToolGuard(allow=["safe"])
+
+          @guard.tool
+          def safe() -> str:
+              return "ok"
+
+          @guard.tool
+          def danger() -> str:
+              return "boom"
+
+          assert guard.call("safe") == "ok"
+          try:
+              guard.call("danger")
+          except ToolNotAllowed:
+              print("denied as expected")
+          else:
+              raise SystemExit("denylist was NOT enforced")
+          PY
+
+      - name: Timeout abandons the call promptly
+        run: |
+          python - <<'PY'
+          import time
+          from toolguard import Limits, ToolGuard, ToolTimeout
+
+          guard = ToolGuard(limits=Limits(call_timeout_s=0.05))
+
+          @guard.tool
+          def slow() -> str:
+              time.sleep(5)
+              return "never"
+
+          start = time.monotonic()
+          try:
+              guard.call("slow")
+          except ToolTimeout:
+              elapsed = time.monotonic() - start
+              assert elapsed < 2.0, f"took {elapsed}s"
+              print(f"timed out in {elapsed:.3f}s")
+          else:
+              raise SystemExit("timeout was NOT enforced")
+          PY
